@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
@@ -9,10 +11,39 @@ import unittest
 from unittest.mock import patch
 import urllib.request
 
+from PIL import Image, ImageOps
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from wechat_mp_export.auth import WeReadClient, gen_signature, render_qr_terminal
+from wechat_mp_export.auth import WeReadClient, gen_signature
+from wechat_mp_export.cli import main
 from wechat_mp_export.halo_importer import HaloImportOptions, import_bundle_to_halo, to_utc_iso
+
+
+# QR modules for a synthetic payload ("FIXTURE LOGIN").
+_QR_MODULES = (
+    "111111100001001111111",
+    "100000101101001000001",
+    "101110100111101011101",
+    "101110100101001011101",
+    "101110101001101011101",
+    "100000100001001000001",
+    "111111101010101111111",
+    "000000000010000000000",
+    "101010100010100010010",
+    "100111000011001001100",
+    "011110111001001111011",
+    "111101001111100000101",
+    "100010101001001001100",
+    "000000001000011100011",
+    "111111100100110101100",
+    "100000100010011010011",
+    "101110101100101011111",
+    "101110100001010001110",
+    "101110101011001100101",
+    "100000100011110100011",
+    "111111101111001111101",
+)
 
 
 class _InMemoryHaloHTTPHandler(urllib.request.HTTPHandler):
@@ -111,9 +142,6 @@ class TestAuthAndHaloImporter(unittest.TestCase):
         self.assertEqual(len(sig1), 64)
         self.assertEqual(sig1, sig2)
 
-        qr_str = render_qr_terminal("https://open.weixin.qq.com/connect/qrcode/demo")
-        self.assertTrue(len(qr_str.splitlines()) >= 10)
-
         with tempfile.TemporaryDirectory() as tmp:
             client = WeReadClient(state_dir=Path(tmp) / "state")
             self.assertFalse(client.has_valid_session())
@@ -125,6 +153,78 @@ class TestAuthAndHaloImporter(unittest.TestCase):
             self.assertEqual(unmasked["vid"], "12345678")
             client.logout()
             self.assertFalse(client.has_valid_session())
+
+    def test_auth_commands_display_modules_from_the_official_image(self) -> None:
+        image = Image.new("L", (21, 21))
+        image.putdata([0 if bit == "1" else 255 for row in _QR_MODULES for bit in row])
+        image = image.resize((105, 126), Image.Resampling.NEAREST)
+        image = ImageOps.expand(image, border=(11, 13, 14, 15), fill=255)
+        jpeg = io.BytesIO()
+        image.save(jpeg, format="JPEG")
+        official_jpeg = jpeg.getvalue()
+        encoded = base64.b64encode(official_jpeg).decode("ascii")
+        proxy = "http://127.0.0.1:7890"
+
+        for action, embedded in (("login", encoded), ("start", None), ("start", "invalid image")):
+            with (
+                self.subTest(action=action, embedded_image=embedded == encoded),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                state_dir = Path(tmp) / "state"
+                dest = Path(tmp) / "custom_qr.png"
+                qr_info = {"uuid": "test-session", "qrcode": {"qrcodebase64": embedded}}
+                stdout = io.StringIO()
+                with (
+                    patch.object(WeReadClient, "_fetch_qr_data", return_value=qr_info),
+                    patch.object(WeReadClient, "poll_qr_login", return_value={"vid_masked": "1***"}) as poll,
+                    patch("wechat_mp_export.auth.get_data_client") as http,
+                    redirect_stdout(stdout),
+                ):
+                    http.return_value.get.return_value.content = official_jpeg
+                    code = main([
+                        "auth", "--state-dir", str(state_dir), "--proxy", proxy,
+                        action, "--qr-output", str(dest),
+                    ])
+                    self.assertEqual(code, 0)
+                    self.assertEqual(poll.call_count, int(action == "login"))
+                    if embedded == encoded:
+                        http.assert_not_called()
+                    else:
+                        http.return_value.get.assert_called_once_with(
+                            "https://open.weixin.qq.com/connect/qrcode/test-session",
+                            proxies={"http": proxy, "https": proxy}, timeout=12,
+                        )
+
+                # Reconstruct the QR from stdout and compare every module, including its white border.
+                rows = []
+                upper = {" ": "0", "▀": "1", "▄": "0", "█": "1"}
+                lower = {" ": "0", "▀": "0", "▄": "1", "█": "1"}
+                for line in stdout.getvalue().split("\n\n", 1)[0].splitlines():
+                    self.assertTrue(line.startswith("\x1b[30;107m") and line.endswith("\x1b[0m"))
+                    blocks = line.removeprefix("\x1b[30;107m").removesuffix("\x1b[0m")
+                    rows.extend(("".join(upper[b] for b in blocks), "".join(lower[b] for b in blocks)))
+                white = "0" * 29
+                expected = [white] * 4 + ["0000" + row + "0000" for row in _QR_MODULES] + [white] * 5
+                self.assertEqual(rows, expected)
+                with Image.open(dest) as png, Image.open(io.BytesIO(official_jpeg)) as original:
+                    saved_qr = png.crop((24, 24, png.width - 24, png.height - 24))
+                    self.assertEqual(saved_qr.tobytes(), original.convert("RGB").tobytes())
+
+    def test_auth_without_an_official_image_reports_an_error(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(WeReadClient, "_fetch_qr_data", return_value={"uuid": "test-session"}),
+            patch("wechat_mp_export.auth.get_data_client") as http,
+            redirect_stdout(io.StringIO()) as stdout,
+            redirect_stderr(io.StringIO()) as stderr,
+        ):
+            http.return_value.get.return_value.content = b"<html>Image unavailable</html>"
+            code = main(["auth", "--state-dir", tmp, "start"])
+            self.assertEqual(code, 2)
+            self.assertIn("Unable to retrieve the WeChat login QR image", stderr.getvalue())
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertFalse((Path(tmp) / "qr_session.json").exists())
+            self.assertFalse((Path(tmp) / "login_qr.png").exists())
 
     def test_utc_conversion_and_halo_idempotent_import(self) -> None:
         self.assertEqual(to_utc_iso("2024-05-06T09:30:00+08:00"), "2024-05-06T01:30:00Z")

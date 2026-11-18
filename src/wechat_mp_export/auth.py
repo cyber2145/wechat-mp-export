@@ -15,10 +15,10 @@ import threading
 import time
 import urllib.parse
 import uuid
+from itertools import takewhile
 from pathlib import Path
 from typing import Any, Callable
 
-import qrcode
 import requests
 from PIL import Image, ImageOps
 
@@ -142,32 +142,51 @@ def gen_signature(parts: list[str]) -> str:
     return hashlib.sha256(shifted2).hexdigest()
 
 
-def render_qr_terminal(url: str) -> str:
-    """Render a compact Unicode half-block QR code for terminal scanning."""
-    qr = qrcode.QRCode(box_size=1, border=2)
-    qr.add_data(url)
-    qr.make(fit=True)
-    matrix = qr.get_matrix()
-    lines: list[str] = []
-    rows = len(matrix)
-    cols = len(matrix[0]) if rows else 0
-    for r in range(0, rows, 2):
-        row_chars: list[str] = []
-        top_row = matrix[r]
-        bot_row = matrix[r + 1] if (r + 1) < rows else [False] * cols
-        for c in range(cols):
-            top = bool(top_row[c])
-            bot = bool(bot_row[c])
-            if top and bot:
-                row_chars.append(" ")
-            elif top and not bot:
-                row_chars.append("▄")
-            elif not top and bot:
-                row_chars.append("▀")
-            else:
-                row_chars.append("█")
-        lines.append("".join(row_chars))
-    return "\n".join(lines)
+def render_qr_terminal(image: Image.Image) -> str:
+    """Render the modules of WeChat's QR image as Unicode half blocks."""
+    dark = image.convert("L").point(lambda value: 255 if value < 128 else 0, mode="1")
+    bounds = dark.getbbox()
+    invalid = "WeChat returned an unreadable login QR image. Please start a fresh login."
+    if bounds is None:
+        raise WeReadAuthError(invalid)
+
+    code = dark.crop(bounds)
+    pixels = code.load()
+    # The top-left finder is seven modules wide. QR sides are 21, 25, 29, ... modules.
+    finder_width = sum(1 for _ in takewhile(bool, (pixels[x, 0] for x in range(code.width))))
+    finder_height = sum(1 for _ in takewhile(bool, (pixels[0, y] for y in range(code.height))))
+    if not finder_width or not finder_height:
+        raise WeReadAuthError(invalid)
+    modules = 21 + 4 * round((7 * code.width / finder_width - 21) / 4)
+    vertical_modules = 21 + 4 * round((7 * code.height / finder_height - 21) / 4)
+    if modules != vertical_modules or not 21 <= modules <= 177:
+        raise WeReadAuthError(invalid)
+
+    code = code.resize((modules, modules), Image.Resampling.NEAREST)
+    pixels = code.load()
+    for left, top in ((0, 0), (modules - 7, 0), (0, modules - 7)):
+        if any(
+            bool(pixels[left + x, top + y]) != (max(abs(x - 3), abs(y - 3)) != 2)
+            for y in range(7) for x in range(7)
+        ):
+            raise WeReadAuthError(invalid)
+
+    # Four white modules around the symbol, plus one row to complete the last half block.
+    code = ImageOps.expand(code, border=(4, 4, 4, 5), fill=0)
+    pixels = code.load()
+    blocks = {(False, False): " ", (True, False): "▀", (False, True): "▄", (True, True): "█"}
+    # Set both colors so light and dark terminal themes display the same polarity.
+    return "\n".join(
+        "\x1b[30;107m"
+        + "".join(blocks[bool(pixels[x, y]), bool(pixels[x, y + 1])] for x in range(code.width))
+        + "\x1b[0m"
+        for y in range(0, code.height, 2)
+    )
+
+
+def _read_qr_image(raw: bytes) -> Image.Image:
+    with Image.open(io.BytesIO(raw)) as image:
+        return image.convert("RGB")
 
 
 class WeReadClient:
@@ -296,20 +315,25 @@ class WeReadClient:
         qr_resp.raise_for_status()
         return qr_resp.json()
 
-    def _save_qr_png(self, qr_info: dict[str, Any], qr_url: str, dest: Path) -> Path:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        b64 = ((qr_info.get("qrcode") or {}).get("qrcodebase64") or "").strip()
+    def _fetch_qr_image(self, qr_info: dict[str, Any], qr_url: str) -> Image.Image:
+        qr_payload = qr_info.get("qrcode")
+        b64 = qr_payload.get("qrcodebase64") if isinstance(qr_payload, dict) else None
         if b64:
-            raw = base64.b64decode(b64)
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
-            img = ImageOps.expand(img, border=24, fill="white")
-            img.save(dest, format="PNG")
-        else:
-            qr = qrcode.QRCode(box_size=10, border=4)
-            qr.add_data(qr_url)
-            qr.make(fit=True)
-            img = qr.make_image(fill_color="black", back_color="white")
-            img.save(dest)
+            try:
+                return _read_qr_image(base64.b64decode(b64))
+            except (OSError, TypeError, ValueError):
+                pass
+
+        try:
+            response = get_data_client().get(qr_url, proxies=self.proxies, timeout=12)
+            response.raise_for_status()
+            return _read_qr_image(response.content)
+        except (OSError, ValueError, requests.RequestException):
+            raise WeReadAuthError("Unable to retrieve the WeChat login QR image. Please try again.") from None
+
+    def _save_qr_png(self, image: Image.Image, dest: Path) -> Path:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        ImageOps.expand(image, border=24, fill="white").save(dest, format="PNG")
         if os.name != "nt":
             try:
                 os.chmod(dest, 0o600)
@@ -321,9 +345,11 @@ class WeReadClient:
         qr_info = self._fetch_qr_data()
         uuid_val = str(qr_info.get("uuid") or "").strip()
         if not uuid_val:
-            raise RuntimeError(f"Failed to obtain QR login UUID: {redact_text(str(qr_info))}")
-        qr_url = f"https://open.weixin.qq.com/connect/qrcode/{uuid_val}"
-        png_path = self._save_qr_png(qr_info, qr_url, qr_output or self.default_qr_png)
+            raise WeReadAuthError("WeChat did not return a QR login session. Please try again.")
+        qr_url = "https://open.weixin.qq.com/connect/qrcode/" + urllib.parse.quote(uuid_val, safe="")
+        image = self._fetch_qr_image(qr_info, qr_url)
+        terminal_qr = render_qr_terminal(image)
+        png_path = self._save_qr_png(image, qr_output or self.default_qr_png)
         now = time.time()
         state = {
             "uuid": uuid_val,
@@ -339,7 +365,7 @@ class WeReadClient:
             "qr_url": qr_url,
             "qr_image": str(png_path),
             "expires_in_seconds": 300,
-            "ascii_qr": render_qr_terminal(qr_url),
+            "ascii_qr": terminal_qr,
         }
 
     def _exchange_auth_code(self, wx_code: str, device_profile: dict[str, Any]) -> dict[str, Any]:
