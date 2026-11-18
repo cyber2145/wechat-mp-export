@@ -37,7 +37,7 @@
 要求 Python **3.10+**。
 
 ```bash
-git clone https://github.com/your-org/wechat-mp-export.git
+git clone https://github.com/qiao-y/wechat-mp-export.git
 cd wechat-mp-export
 
 python3 -m venv .venv
