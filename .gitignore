@@ -1,0 +1,48 @@
+# Python bytecode & packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment & local credentials (NEVER commit!)
+.env
+.env.*
+!.env.example
+*session*.json
+*auth*.json
+*credential*.json
+*account_pool*.json
+*token*.json
+*_qr.png
+*login_qr*.png
+*.pem
+*.key
+state/
+.state/
+
+# Default local export output directories
+exports/
+output/
+halo_import_state.json
+
+# OS / IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+*.bak
